@@ -1,7 +1,6 @@
-# ==============================================
-# ADVANCED TIME SERIES FORECASTING PROJECT
-# LSTM + UNCERTAINTY QUANTIFICATION
-# ==============================================
+# =========================================================
+# ADVANCED TIME SERIES FORECASTING WITH UQ (FINAL VERSION)
+# =========================================================
 
 import numpy as np
 import pandas as pd
@@ -13,24 +12,24 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 from itertools import product
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-np.random.seed(42)
 torch.manual_seed(42)
+np.random.seed(42)
 
-# ==============================================
-# 1. DATA GENERATION (complex non-stationary)
-# ==============================================
-def generate_time_series(n_steps=2500):
-    t = np.arange(n_steps)
+# =========================================================
+# 1. DATA GENERATION
+# =========================================================
+def generate_data(n=3000):
+    t = np.arange(n)
 
-    trend = 0.005 * t
-    season1 = 2 * np.sin(0.02 * t)
-    season2 = 0.5 * np.sin(0.15 * t)
-    noise = np.random.normal(0, 0.5, n_steps)
+    trend = 0.003 * t
+    season1 = 2*np.sin(0.02*t)
+    season2 = 0.5*np.sin(0.15*t)
+    noise = np.random.normal(0, 0.4, n)
 
-    exog1 = np.sin(0.03 * t) + np.random.normal(0, 0.2, n_steps)
-    exog2 = np.cos(0.05 * t) + np.random.normal(0, 0.2, n_steps)
+    exog1 = np.sin(0.05*t) + np.random.normal(0,0.2,n)
+    exog2 = np.cos(0.03*t) + np.random.normal(0,0.2,n)
 
-    y = trend + season1 + season2 + noise + 0.3 * exog1
+    y = trend + season1 + season2 + noise + 0.4*exog1
 
     df = pd.DataFrame({
         "target": y,
@@ -40,166 +39,169 @@ def generate_time_series(n_steps=2500):
 
     return df
 
-# ==============================================
-# 2. DATA PREP
-# ==============================================
-def create_sequences(data, seq_len=40, horizon=1):
+# =========================================================
+# 2. SEQUENCE CREATION
+# =========================================================
+def create_sequences(data, seq_len=50):
     X, y = [], []
-    for i in range(len(data) - seq_len - horizon):
+    for i in range(len(data)-seq_len):
         X.append(data[i:i+seq_len])
-        y.append(data[i+seq_len:i+seq_len+horizon, 0])
+        y.append(data[i+seq_len, 0])
     return np.array(X), np.array(y)
 
-# ==============================================
+# =========================================================
 # 3. MODEL
-# ==============================================
+# =========================================================
 class QuantileLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, dropout, quantiles):
+    def __init__(self, input_size, hidden_size, layers, dropout):
         super().__init__()
-        self.quantiles = quantiles
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                            batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_size, len(quantiles))
+
+        self.quantiles = [0.1, 0.5, 0.9]
+
+        self.lstm = nn.LSTM(input_size, hidden_size,
+                            num_layers=layers,
+                            batch_first=True,
+                            dropout=dropout)
+
+        self.fc = nn.Linear(hidden_size, len(self.quantiles))
 
     def forward(self, x):
-        out, _ = self.lstm(x)
-        out = out[:, -1, :]
+        out,_ = self.lstm(x)
+        out = out[:,-1,:]
         out = self.fc(out)
         return out
 
-# ==============================================
-# 4. LOSS (Pinball)
-# ==============================================
-def quantile_loss(preds, target, quantiles):
-    losses = []
-    for i, q in enumerate(quantiles):
-        errors = target - preds[:, i]
-        losses.append(torch.max((q-1)*errors, q*errors).unsqueeze(1))
-    loss = torch.mean(torch.sum(torch.cat(losses, dim=1), dim=1))
+# =========================================================
+# 4. QUANTILE LOSS
+# =========================================================
+def quantile_loss(pred, target, quantiles):
+    loss = 0
+    for i,q in enumerate(quantiles):
+        error = target - pred[:,i]
+        loss += torch.mean(torch.max((q-1)*error, q*error))
     return loss
 
-# ==============================================
+# =========================================================
 # 5. TRAIN FUNCTION
-# ==============================================
-def train_model(model, X_train, y_train, epochs=20, lr=0.001):
-    model.to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+# =========================================================
+def train_model(model, X_train, y_train, epochs=20):
+
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     X_t = torch.tensor(X_train, dtype=torch.float32).to(DEVICE)
     y_t = torch.tensor(y_train, dtype=torch.float32).to(DEVICE)
 
-    for epoch in range(epochs):
+    for ep in range(epochs):
         model.train()
         optimizer.zero_grad()
-        preds = model(X_t)
-        loss = quantile_loss(preds, y_t, model.quantiles)
+
+        pred = model(X_t)
+        loss = quantile_loss(pred, y_t.unsqueeze(1), model.quantiles)
+
         loss.backward()
         optimizer.step()
 
     return model
 
-# ==============================================
+# =========================================================
 # 6. MC DROPOUT PREDICTION
-# ==============================================
-def mc_dropout_predict(model, X, n_samples=50):
+# =========================================================
+def mc_dropout_predict(model, X, samples=100):
+
     model.train()
     preds = []
+
     X_t = torch.tensor(X, dtype=torch.float32).to(DEVICE)
 
-    for _ in range(n_samples):
+    for _ in range(samples):
         with torch.no_grad():
             preds.append(model(X_t).cpu().numpy())
 
-    preds = np.stack(preds)
-    return preds.mean(axis=0)
+    preds = np.array(preds)
+    mean_preds = preds.mean(axis=0)
 
-# ==============================================
+    lower = mean_preds[:,0]
+    median = mean_preds[:,1]
+    upper = mean_preds[:,2]
+
+    return lower, median, upper
+
+# =========================================================
 # 7. METRICS
-# ==============================================
-def coverage_probability(y_true, lower, upper):
-    return np.mean((y_true >= lower) & (y_true <= upper))
+# =========================================================
+def coverage_probability(y, lower, upper):
+    return np.mean((y>=lower)&(y<=upper))
 
 def interval_width(lower, upper):
-    return np.mean(upper - lower)
+    return np.mean(upper-lower)
 
-# ==============================================
-# 8. BASELINE MODEL
-# ==============================================
-def naive_forecast(series):
-    return series[:-1]
-
-# ==============================================
+# =========================================================
 # MAIN PIPELINE
-# ==============================================
+# =========================================================
 def main():
 
-    df = generate_time_series()
+    print("\nGenerating dataset...")
+    df = generate_data()
+
     scaler = StandardScaler()
     scaled = scaler.fit_transform(df)
 
-    seq_len = 40
-    X, y = create_sequences(scaled, seq_len)
+    X, y = create_sequences(scaled, 50)
 
     split = int(len(X)*0.8)
+
     X_train, X_test = X[:split], X[split:]
     y_train, y_test = y[:split], y[split:]
 
-    quantiles = [0.1, 0.5, 0.9]
-
     best_model = None
-    best_loss = 9999
+    best_rmse = 999
 
-    # Hyperparameter grid
-    hidden_sizes = [32, 64]
-    layers = [1, 2]
-    dropouts = [0.1, 0.3]
+    print("\nHyperparameter tuning...")
 
-    for hs, nl, dr in product(hidden_sizes, layers, dropouts):
+    for hidden, layers, drop in product([32,64], [1,2], [0.1,0.3]):
 
-        model = QuantileLSTM(
-            input_size=X.shape[2],
-            hidden_size=hs,
-            num_layers=nl,
-            dropout=dr,
-            quantiles=quantiles
-        )
+        model = QuantileLSTM(X.shape[2], hidden, layers, drop).to(DEVICE)
+        model = train_model(model, X_train, y_train)
 
-        model = train_model(model, X_train, y_train, epochs=15)
+        _, median, _ = mc_dropout_predict(model, X_test)
+        rmse = np.sqrt(mean_squared_error(y_test, median))
 
-        preds = mc_dropout_predict(model, X_test)
-        loss = mean_squared_error(y_test[:,0], preds[:,1])
-
-        if loss < best_loss:
-            best_loss = loss
+        if rmse < best_rmse:
+            best_rmse = rmse
             best_model = model
 
     print("Best model selected")
 
-    # FINAL PREDICTION
-    preds = mc_dropout_predict(best_model, X_test)
+    # ==========================
+    # FINAL DL MODEL EVALUATION
+    # ==========================
+    lower, median, upper = mc_dropout_predict(best_model, X_test)
 
-    lower = preds[:,0]
-    median = preds[:,1]
-    upper = preds[:,2]
+    rmse_dl = np.sqrt(mean_squared_error(y_test, median))
+    mae_dl = mean_absolute_error(y_test, median)
 
-    y_true = y_test[:,0]
-
-    rmse = np.sqrt(mean_squared_error(y_true, median))
-    mae = mean_absolute_error(y_true, median)
-
-    cp = coverage_probability(y_true, lower, upper)
+    cp = coverage_probability(y_test, lower, upper)
     iw = interval_width(lower, upper)
 
-    print("\n===== FINAL METRICS =====")
-    print("RMSE:", rmse)
-    print("MAE:", mae)
+    print("\nDEEP LEARNING RESULTS")
+    print("RMSE:", rmse_dl)
+    print("MAE:", mae_dl)
     print("Coverage Probability:", cp)
     print("Interval Width:", iw)
 
-    # Baseline
-    baseline = naive_forecast(df["target"].values)
-    baseline_rmse = np.sqrt(mean_squared_error(df["target"].values[1:], baseline))
-    print("Baseline RMSE:", baseline_rmse)
+    # ==========================
+    # BASELINE (TEST SET ONLY)
+    # ==========================
+    baseline_preds = X_test[:,-1,0]
+
+    rmse_base = np.sqrt(mean_squared_error(y_test, baseline_preds))
+    mae_base = mean_absolute_error(y_test, baseline_preds)
+
+    print("\nBASELINE RESULTS")
+    print("RMSE:", rmse_base)
+    print("MAE:", mae_base)
+
+    print("\nProject execution complete.")
 
 if __name__ == "__main__":
     main()
